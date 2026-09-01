@@ -1,0 +1,194 @@
+---
+- name: Configure compute node
+  hosts: compute
+  become: true
+  vars_files:
+    - ../group_vars/all.yml
+  tasks:
+    - name: Set hostname
+      ansible.builtin.hostname:
+        name: compute1.slurm.test
+
+    - name: Configure hosts before IPA enrollment
+      ansible.builtin.copy:
+        dest: /etc/hosts
+        content: |
+          127.0.0.1 localhost localhost.localdomain
+          {{ controller_ip }} controller.slurm.test controller
+          {{ compute1_ip }} compute1.slurm.test compute1
+
+    - name: Install EPEL repository
+      ansible.builtin.dnf:
+        name: epel-release
+        state: present
+
+    - name: Enable CRB repository
+      ansible.builtin.command: dnf config-manager --set-enabled crb
+      changed_when: false
+      failed_when: false
+
+    - name: Point DNS at FreeIPA controller
+      ansible.builtin.copy:
+        dest: /etc/resolv.conf
+        content: |
+          search {{ domain }}
+          nameserver {{ controller_ip }}
+          nameserver 8.8.8.8
+
+    - name: Install compute packages
+      ansible.builtin.dnf:
+        name:
+          - ipa-client
+          - sssd
+          - oddjob-mkhomedir
+          - authselect
+          - firewalld
+          - munge
+          - nfs-utils
+          - slurm
+          - slurm-slurmd
+        state: present
+
+    - name: Enable firewalld
+      ansible.builtin.systemd:
+        name: firewalld
+        enabled: true
+        state: started
+
+    - name: Open Slurm daemon port
+      ansible.builtin.command: firewall-cmd --permanent --add-port=6818/tcp
+      register: firewall_slurmd
+      changed_when: "'success' in firewall_slurmd.stdout"
+
+    - name: Reload firewalld
+      ansible.builtin.command: firewall-cmd --reload
+      changed_when: false
+
+    - name: Check IPA enrollment
+      ansible.builtin.stat:
+        path: /etc/ipa/default.conf
+      register: ipa_client
+
+    - name: Enable IPv6 globally
+      ansible.builtin.command:
+        cmd: sysctl -w net.ipv6.conf.all.disable_ipv6=0
+      changed_when: false
+
+    - name: Enable IPv6 on loopback
+      ansible.builtin.command:
+        cmd: sysctl -w net.ipv6.conf.lo.disable_ipv6=0
+      changed_when: false
+
+    - name: Ensure IPv6 loopback address exists
+      ansible.builtin.command:
+        cmd: ip -6 addr add ::1/128 dev lo
+      register: ipv6_loopback
+      changed_when: ipv6_loopback.rc == 0
+      failed_when:
+        - ipv6_loopback.rc != 0
+        - "'File exists' not in ipv6_loopback.stderr"
+
+    - name: Verify IPv6 loopback
+      ansible.builtin.command:
+        cmd: ip -6 addr show dev lo
+      register: ipv6_lo
+      changed_when: false
+
+    - name: Show IPv6 loopback
+      ansible.builtin.debug:
+        var: ipv6_lo.stdout
+
+    - name: Enroll compute node in FreeIPA
+      ansible.builtin.command: >
+        ipa-client-install --unattended
+        --domain={{ domain }}
+        --realm={{ realm }}
+        --server=controller.slurm.test
+        --principal=admin
+        --password={{ ipa_admin_password }}
+        --mkhomedir
+        --force-join
+      when: not ipa_client.stat.exists
+      no_log: true
+
+    - name: Enable SSSD
+      ansible.builtin.systemd:
+        name: sssd
+        enabled: true
+        state: started
+
+    - name: Create mount point
+      ansible.builtin.file:
+        path: /home/ipa
+        state: directory
+        mode: "0755"
+  
+    - name: Mount shared home directory
+      ansible.builtin.mount:
+        src: "{{ controller_ip }}:/export/home"
+        path: /home/ipa
+        fstype: nfs
+        opts: rw,_netdev
+        state: mounted
+
+    - name: Fetch MUNGE key from controller
+      ansible.builtin.fetch:
+        src: /etc/munge/munge.key
+        dest: /tmp/munge-controller/
+        flat: true
+      delegate_to: controller
+      become: true
+
+    - name: Copy MUNGE key
+      ansible.builtin.copy:
+        src: /tmp/munge-controller/munge.key
+        dest: /etc/munge/munge.key
+        owner: munge
+        group: munge
+        mode: "0400"
+
+    - name: Start MUNGE
+      ansible.builtin.systemd:
+        name: munge
+        enabled: true
+        state: started
+
+    - name: Ensure slurm group exists
+      ansible.builtin.group:
+        name: slurm
+        system: true
+        state: present
+
+    - name: Ensure slurm user exists
+      ansible.builtin.user:
+        name: slurm
+        group: slurm
+        system: true
+        shell: /sbin/nologin
+        create_home: false
+        state: present
+        
+    - name: Create Slurm directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: slurm
+        group: slurm
+      loop:
+        - /etc/slurm
+        - /var/spool/slurmd
+        - /var/log/slurm
+
+    - name: Install slurm.conf
+      ansible.builtin.template:
+        src: ../templates/slurm.conf.j2
+        dest: /etc/slurm/slurm.conf
+        owner: slurm
+        group: slurm
+        mode: "0644"
+
+    - name: Start Slurm daemon
+      ansible.builtin.systemd:
+        name: slurmd
+        enabled: true
+        state: started

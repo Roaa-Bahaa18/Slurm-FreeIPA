@@ -1,0 +1,11 @@
+---
+domain: slurm.test
+realm: SLURM.TEST
+controller_ip: 192.168.56.10
+compute1_ip: 192.168.56.11
+compute1_cpus: 2
+cluster_name: hpccluster
+ipa_admin_password: Admin@183
+test_user: hpcuser
+test_user_password: User@183
+krb5_ccache: /tmp/krb5cc_hpcadmin

@@ -1,0 +1,276 @@
+---
+- name: Configure controller and orchestrate compute node
+  hosts: controller
+  become: true
+  vars_files:
+    - ../group_vars/all.yml
+  tasks:
+    - name: Install EPEL repository
+      ansible.builtin.dnf:
+        name: epel-release
+        state: present
+
+    - name: Enable CRB
+      ansible.builtin.command: dnf config-manager --set-enabled crb
+      changed_when: false
+      failed_when: false
+
+    - name: Install base and FreeIPA packages
+      ansible.builtin.dnf:
+        name:
+          - ipa-server
+          - ipa-server-dns
+          - bind-utils
+          - firewalld
+          - munge
+          - nfs-utils
+          - slurm
+          - slurm-slurmctld
+        state: present
+
+    - name: Set hostname
+      ansible.builtin.hostname:
+        name: controller.slurm.test
+
+    - name: Configure hosts
+      ansible.builtin.copy:
+        dest: /etc/hosts
+        content: |
+          127.0.0.1 localhost localhost.localdomain
+          {{ controller_ip }} controller.slurm.test controller
+          {{ compute1_ip }} compute1.slurm.test compute1
+
+    - name: Enable firewalld
+      ansible.builtin.systemd:
+        name: firewalld
+        enabled: true
+        state: started
+
+    - name: Open FreeIPA firewall service bundle
+      ansible.builtin.command: firewall-cmd --permanent --add-service=freeipa-4
+      register: firewall_ipa
+      changed_when: "'success' in firewall_ipa.stdout"
+
+    - name: Open NFS-related firewall services
+      ansible.builtin.command: "firewall-cmd --permanent --add-service={{ item }}"
+      loop:
+        - nfs
+        - rpc-bind
+        - mountd
+      register: firewall_nfs
+      changed_when: "'success' in firewall_nfs.stdout"
+
+    - name: Open Slurm controller port
+      ansible.builtin.command: firewall-cmd --permanent --add-port=6817/tcp
+      register: firewall_slurm
+      changed_when: "'success' in firewall_slurm.stdout"
+
+    - name: Reload firewalld
+      ansible.builtin.command: firewall-cmd --reload
+      changed_when: false
+
+    - name: Check whether FreeIPA is already installed
+      ansible.builtin.stat:
+        path: /etc/ipa/default.conf
+      register: ipa_config
+
+    - name: Enable IPv6 globally
+      ansible.builtin.command:
+        cmd: sysctl -w net.ipv6.conf.all.disable_ipv6=0
+      changed_when: false
+
+    - name: Enable IPv6 on loopback
+      ansible.builtin.command:
+        cmd: sysctl -w net.ipv6.conf.lo.disable_ipv6=0
+      changed_when: false
+
+    - name: Ensure IPv6 loopback address exists
+      ansible.builtin.command:
+        cmd: ip -6 addr add ::1/128 dev lo
+      register: ipv6_loopback
+      changed_when: ipv6_loopback.rc == 0
+      failed_when:
+        - ipv6_loopback.rc != 0
+        - "'File exists' not in ipv6_loopback.stderr"
+
+    - name: Verify IPv6 loopback
+      ansible.builtin.command:
+        cmd: ip -6 addr show dev lo
+      register: ipv6_lo
+      changed_when: false
+
+    - name: Show IPv6 loopback
+      ansible.builtin.debug:
+        var: ipv6_lo.stdout
+
+    - name: Install FreeIPA server with integrated DNS
+      ansible.builtin.command: >
+        ipa-server-install --unattended
+        --hostname=controller.slurm.test
+        --domain={{ domain }}
+        --realm={{ realm }}
+        --ds-password={{ ipa_admin_password }}
+        --admin-password={{ ipa_admin_password }}
+        --setup-dns
+        --forwarder=8.8.8.8
+        --no-reverse
+      when: not ipa_config.stat.exists
+      no_log: true 
+  
+    - name: Ensure IPA services are running
+      ansible.builtin.command: ipactl start
+      changed_when: false
+      failed_when: false
+
+    - name: Obtain Kerberos ticket for IPA admin
+      ansible.builtin.shell: |
+        echo '{{ ipa_admin_password }}' | kinit admin
+      args:
+        executable: /bin/bash
+      no_log: true
+      changed_when: false
+    
+    - name: Set default IPA home directory to shared NFS path
+      ansible.builtin.command: ipa config-mod --homedirectory=/home/ipa
+      environment:
+        KRB5CCNAME: "{{ krb5_ccache }}"
+      changed_when: true
+      failed_when: false
+
+    - name: Obtain Kerberos ticket for IPA admin
+      ansible.builtin.shell: |
+        echo '{{ ipa_admin_password }}' | kinit admin
+      become: false
+      no_log: true
+      changed_when: false
+      tags:
+        - continue
+
+    - name: Add compute DNS record
+      ansible.builtin.command:
+        cmd: ipa dnsrecord-add {{ domain }} compute1 --a-rec={{ compute1_ip }}
+      become: false
+      tags:
+        - continue
+
+    - name: Ensure shared home export directory exists
+      ansible.builtin.file:
+        path: /export/home
+        state: directory
+        mode: "0755"
+      tags:
+        - continue
+
+    - name: Configure NFS export
+      ansible.builtin.copy:
+        dest: /etc/exports.d/home.exports
+        content: "/home {{ compute1_ip }}(rw,sync,no_root_squash)\n"
+      tags:
+        - continue
+
+    - name: Enable NFS server
+      ansible.builtin.systemd:
+        name: nfs-server
+        enabled: true
+        state: started
+      tags:
+        - continue
+
+    - name: Export NFS shares
+      ansible.builtin.command: exportfs -rav
+      changed_when: false
+      tags:
+        - continue
+
+    - name: Generate MUNGE key if absent
+      ansible.builtin.command: /usr/sbin/create-munge-key
+      args:
+        creates: /etc/munge/munge.key
+      failed_when: false
+      tags:
+        - continue
+
+    - name: Start MUNGE
+      ansible.builtin.systemd:
+        name: munge
+        enabled: true
+        state: started
+      tags:
+        - continue
+
+    - name: Ensure slurm group exists
+      ansible.builtin.group:
+       name: slurm
+       system: true
+
+    - name: Ensure slurm user exists
+      ansible.builtin.user:
+        name: slurm
+        group: slurm
+        system: true
+        shell: /sbin/nologin
+        create_home: false
+
+    - name: Create Slurm directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: slurm
+        group: slurm
+        mode: "0755"
+      loop:
+        - /etc/slurm
+        - /var/spool/slurmctld
+        - /var/log/slurm
+      tags:
+        - continue
+
+    - name: Install slurm.conf
+      ansible.builtin.template:
+        src: ../templates/slurm.conf.j2
+        dest: /etc/slurm/slurm.conf
+        owner: slurm
+        group: slurm
+        mode: "0644"
+      tags:
+        - continue
+
+    - name: Start Slurm controller
+      ansible.builtin.systemd:
+        name: slurmctld
+        enabled: true
+        state: started
+      tags:
+        - continue
+
+    - name: Wait for compute SSH
+      ansible.builtin.wait_for:
+        host: "{{ compute1_ip }}"
+        port: 22
+        timeout: 300
+      tags:
+        - continue
+
+    - name: Configure compute node
+      ansible.builtin.command: >
+        sudo ansible-playbook -i /opt/hpc-ansible/inventory/hosts.ini
+        /opt/hpc-ansible/playbooks/compute.yml
+      become: true
+      changed_when: true
+      tags:
+        - continue
+
+
+    - name: Create FreeIPA test user
+      ansible.builtin.shell: |
+        printf '{{ test_user_password }}\n{{ test_user_password }}\n' | ipa user-add {{ test_user }} --first=HPC --last=User --password
+      environment:
+        KRB5CCNAME: "{{ krb5_ccache }}"
+      register: user_add
+      changed_when: "'Added user' in user_add.stdout"
+      failed_when:
+        - user_add.rc != 0
+        - "'already exists' not in user_add.stderr"
+      no_log: true
+      tags:
+        - continue
