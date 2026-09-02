@@ -40,7 +40,7 @@ This project was created to implement the following HPC environment:
      │ Kerberos        │             │                 │
      │ Slurmctld       │◄───────────►│ Slurmd          │
      │ MUNGE           │             │ MUNGE           │
-     │ NFS Server      │────────────►│ NFS Client       │
+     │ NFS Server      │────────────►│ NFS Client      │
      └─────────────────┘             └─────────────────┘
 ```
 
